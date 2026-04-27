@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.6
+#
+# Slim llama-swap orchestrator image.
+# Bundles:
+#   /usr/local/bin/llama-swap     — the proxy itself (Go binary, static)
+#   /usr/local/bin/podman-remote  — talks to the host podman daemon over /run/podman/podman.sock
+#   /usr/local/bin/podman         — symlink to podman-remote, so config.yaml's `podman …` lines work as-is
+#
+# This image does NOT include CUDA, llama.cpp, vLLM, SGLang, or any GPU
+# libraries. The model containers spawned by llama-swap are siblings on the
+# host (created via the bind-mounted podman socket); they get GPU access
+# from the host's CDI device. Keeping the orchestrator small avoids shipping
+# multi-GB CUDA layers in the control-plane image.
+#
+# Build:
+#   podman build -t localhost/llama-swap-orchestrator:latest -f Containerfile .
+# Or with versions overridden:
+#   podman build --build-arg LLAMA_SWAP_VERSION=v208 \
+#                --build-arg PODMAN_VERSION=v5.8.2 \
+#                -t localhost/llama-swap-orchestrator:v208 -f Containerfile .
+
+ARG LLAMA_SWAP_VERSION=v208
+ARG PODMAN_VERSION=v5.8.2
+
+FROM docker.io/library/debian:12-slim AS fetch
+ARG LLAMA_SWAP_VERSION
+ARG PODMAN_VERSION
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl tar && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+
+# llama-swap (release tag is "vNNN", asset path uses the bare number)
+RUN VER="${LLAMA_SWAP_VERSION#v}" && \
+    curl -fsSL --output ls.tgz \
+        "https://github.com/mostlygeek/llama-swap/releases/download/${LLAMA_SWAP_VERSION}/llama-swap_${VER}_linux_amd64.tar.gz" && \
+    tar -xzf ls.tgz llama-swap
+
+# podman-remote static binary
+RUN curl -fsSL --output pr.tgz \
+        "https://github.com/containers/podman/releases/download/${PODMAN_VERSION}/podman-remote-static-linux_amd64.tar.gz" && \
+    tar -xzf pr.tgz && \
+    mv bin/podman-remote-static-linux_amd64 podman-remote
+
+FROM docker.io/library/debian:12-slim
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=fetch /tmp/llama-swap     /usr/local/bin/llama-swap
+COPY --from=fetch /tmp/podman-remote  /usr/local/bin/podman-remote
+RUN chmod 0755 /usr/local/bin/llama-swap /usr/local/bin/podman-remote && \
+    ln -s /usr/local/bin/podman-remote /usr/local/bin/podman
+
+# Stay as root inside the container so we can read the rootful podman
+# socket on the host (which is owned by root:root, mode 0660). The Quadlet
+# does NOT add UidMap/GidMap for this container by default — see the
+# README's "Running llama-swap under a UID range" section if you want to
+# drop that privilege now that the socket-proxy is in the loop.
+USER 0:0
+WORKDIR /app
+
+ENV CONTAINER_HOST=unix:///run/podman/podman.sock
+
+EXPOSE 9292
+ENTRYPOINT ["/usr/local/bin/llama-swap"]
+CMD ["--config", "/etc/llama-swap/config.yaml", "--listen", ":9292", "--watch-config"]

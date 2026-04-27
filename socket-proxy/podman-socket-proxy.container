@@ -1,0 +1,104 @@
+# Quadlet for podman-socket-proxy — gates the host's rootful podman
+# socket on behalf of the llama-swap orchestrator.
+#
+# Pipeline:
+#
+#   llama-swap container ──unix─▶  /run/podman/podman.sock
+#                                  (named-volume mount inside
+#                                   llama-swap, backed by the
+#                                   podman-socket-proxy volume)
+#                                  │
+#                                  ▼
+#                          podman-socket-proxy container
+#                          (listens on /run/socket-proxy/podman.sock,
+#                           same volume mounted at /run/socket-proxy)
+#                                  │
+#                                  ▼
+#                                  /run/upstream/podman.sock
+#                                  (host's rootful podman socket;
+#                                   bind-mounted into the proxy from
+#                                   /run/podman/podman.sock)
+#
+# The named volume (podman-socket-proxy.volume) is what makes the
+# socket file visible in both containers without an operator-managed
+# /run/podman-socket-proxy/ directory that would have to be recreated
+# on every boot. Both containers reference the same volume; the
+# proxy creates the socket file inside it, and llama-swap connects.
+#
+# Privileges:
+#   The proxy runs as host UID 0 inside its namespace because the
+#   upstream `0660 root:root` socket is not reachable from any other
+#   UID. Compensating controls (NoNewPrivileges, ReadOnlyRootfs, all
+#   caps dropped, /tmp tmpfs only) are below.
+#
+# Install:
+#   sudo install -d -m 0755 /etc/podman-socket-proxy
+#   sudo install -m 0644 config.yaml \
+#                /etc/podman-socket-proxy/config.yaml
+#   sudo install -m 0644 podman-socket-proxy.volume \
+#                /etc/containers/systemd/
+#   sudo install -m 0644 podman-socket-proxy.container \
+#                /etc/containers/systemd/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now podman.socket
+#   sudo systemctl start podman-socket-proxy.service
+#
+# Logs:  journalctl -u podman-socket-proxy -f
+
+[Unit]
+Description=podman-socket-proxy (allowlist gate for the rootful podman socket)
+Documentation=file:///etc/podman-socket-proxy/config.yaml
+After=podman.socket
+Requires=podman.socket
+# llama-swap depends on us for its CONTAINER_HOST socket. If the proxy
+# is bounced, llama-swap's in-flight requests fail; systemd restarts it
+# via PartOf when this one comes back.
+Before=llama-swap.service
+
+[Container]
+Image=localhost/podman-socket-proxy:latest
+ContainerName=podman-socket-proxy
+AutoUpdate=registry
+
+# No Network= line: the proxy speaks only on Unix sockets. There is
+# nothing to listen for over IP, and no upstream call to make either.
+
+# Upstream: the host's rootful podman socket. :ro makes the bind mount
+# itself read-only (so the container can't unlink/replace the socket
+# inode), but socket I/O (connect/send/recv) still works because that
+# goes through the kernel's socket layer, not through filesystem
+# writes. :Z relabels for SELinux. Same trick as
+# ../llama-swap/llama-swap.container.
+Volume=/run/podman/podman.sock:/run/upstream/podman.sock:ro,Z
+
+# Listen socket lives in a named volume that llama-swap also mounts
+# (see podman-socket-proxy.volume). :z (lower-case) is the shared
+# SELinux label — required so a second consumer mounting the same
+# volume with :z gets the same type and can read the socket. Don't
+# use :Z here; that's a per-container private label and would make
+# the volume unreadable from llama-swap.
+Volume=podman-socket-proxy.volume:/run/socket-proxy:z
+
+# Operator-supplied policy. Read-only.
+Volume=/etc/podman-socket-proxy/config.yaml:/etc/socket-proxy/config.yaml:ro,Z
+
+# Hardening: every knob the threat model lets us flip. The proxy is a
+# tiny static Go binary that does net.Listen + httputil.ReverseProxy;
+# it has no business writing to disk, gaining capabilities, or
+# fork+exec-ing.
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+
+# /tmp is the only path the proxy might touch (Go's net package
+# occasionally uses it for resolver scratch); a small tmpfs is enough.
+Tmpfs=/tmp:rw,size=16m,mode=1777
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

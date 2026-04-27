@@ -1,0 +1,110 @@
+# Quadlet for llama-swap, sized to fit alongside Traefik and Ollama.
+#
+# Talks to the host's rootful podman daemon through podman-socket-proxy
+# (../socket-proxy/), not directly. The proxy enforces an allowlist
+# policy on every API call llama-swap makes; see ../README.md for the
+# threat model.
+#
+# Networking:
+#   - llama-swap-internal: where llama-swap and the model containers it spawns
+#                          talk to each other (no ports published anywhere).
+#   - traefik-internal:    so Traefik can route incoming TLS traffic to
+#                          llama-swap on port 9292. Adjust the network name if
+#                          yours is different.
+#
+# Privileges:
+#   Runs under host UID range 900000–965535 (UidMap below). Because the
+#   socket-proxy is in the loop, the orchestrator no longer needs host
+#   root to reach the rootful podman socket — it talks to the proxy's
+#   listen socket inside a named volume, and the proxy is configured with
+#   listen_socket_mode: "0666" so a non-root in-container UID can connect.
+#   The proxy itself is what runs as host root and talks to /run/podman/
+#   podman.sock; that's the smaller surface to keep privileged.
+#   See ../README.md "What runs where" + "Why 0666 is fine here".
+#
+# Install (full sequence including the proxy):
+#   # 1. Build images
+#   sudo ../socket-proxy/build-image.sh
+#   sudo ../llama-swap/build-image.sh
+#   # 2. Drop policy + env
+#   sudo install -d -m 0755 /etc/llama-swap /etc/podman-socket-proxy
+#   sudo install -m 0644 ../socket-proxy/config.yaml /etc/podman-socket-proxy/config.yaml
+#   sudo install -m 0644 ../llama-swap/config.yaml   /etc/llama-swap/config.yaml
+#   sudo install -m 0640 ../.env.example             /etc/llama-swap/llama-swap.env
+#   sudoedit /etc/llama-swap/llama-swap.env
+#   # 3. Drop Quadlets
+#   sudo install -m 0644 ../socket-proxy/podman-socket-proxy.volume    /etc/containers/systemd/
+#   sudo install -m 0644 ../socket-proxy/podman-socket-proxy.container /etc/containers/systemd/
+#   sudo install -m 0644 llama-swap-internal.network                   /etc/containers/systemd/
+#   sudo install -m 0644 llama-swap.container                          /etc/containers/systemd/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now podman.socket
+#   sudo systemctl start podman-socket-proxy.service
+#   sudo systemctl start llama-swap.service
+#
+# Logs:  journalctl -u llama-swap -f
+#        journalctl -u podman-socket-proxy -f
+
+[Unit]
+Description=llama-swap proxy (containerised) for vLLM / SGLang / llama.cpp
+Documentation=https://github.com/mostlygeek/llama-swap
+After=podman.socket podman-socket-proxy.service llama-swap-internal-network.service
+Requires=podman.socket podman-socket-proxy.service llama-swap-internal-network.service
+
+[Container]
+Image=localhost/llama-swap-orchestrator:latest
+ContainerName=llama-swap
+AutoUpdate=registry
+
+# Run under a dedicated host UID range (matches scripts/uid-ranges.env's
+# llama-swap-orchestrator entry). With the proxy in the loop, host root
+# is no longer required — see the [Unit] header above and ../README.md
+# "What runs where".
+UIDMap=0:900000:65536
+GIDMap=0:900000:65536
+
+# Both networks: traefik-internal so Traefik can reach :9292,
+# llama-swap-internal so we can reach the model containers we spawn.
+# (Replace traefik-internal with your actual Traefik backend network.)
+Network=traefik-internal.network
+Network=llama-swap-internal.network
+
+# No PublishPort - Traefik fronts the TLS termination on :443.
+# Routing is configured in your Traefik static/file provider, e.g.:
+#   http.services.llamaswap.loadBalancer.servers:
+#     - url: "http://llama-swap:9292"
+# Both Traefik and this container are on traefik-internal, so the DNS
+# name "llama-swap" resolves.
+
+# Talk to the host podman daemon via the proxy. The named volume
+# (declared by ../socket-proxy/podman-socket-proxy.volume and shared
+# with the proxy container) holds the proxy's listen socket. We mount
+# it at /run/podman so the existing
+# CONTAINER_HOST=unix:///run/podman/podman.sock keeps working — the
+# proxy's listen_socket is named podman.sock for exactly this reason.
+#
+# :z is the SHARED SELinux label — required so this container and the
+# proxy see the same SELinux type on the volume contents. :Z would
+# relabel to a private label and break the proxy.
+#
+# Don't add :ro: a Unix socket needs read+write file permission for
+# connect() to succeed; the gate is the file's mode bits, not the
+# bind-mount flag.
+Volume=podman-socket-proxy.volume:/run/podman:z
+
+# Config + env file (host-side, edited via /etc/llama-swap/).
+Volume=/etc/llama-swap/config.yaml:/etc/llama-swap/config.yaml:ro,Z
+EnvironmentFile=/etc/llama-swap/llama-swap.env
+
+# Redeclared here so the unit is self-documenting (also baked into the image).
+Environment=CONTAINER_HOST=unix:///run/podman/podman.sock
+
+[Service]
+Restart=on-failure
+RestartSec=5
+# Give podman 60s to stop spawned model containers before we tear down.
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

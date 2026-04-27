@@ -1,0 +1,32 @@
+# podman-socket-proxy.volume — named volume that holds the proxy's
+# listen socket and is mounted into both the proxy and llama-swap.
+#
+# A named volume is the right substrate for an inter-container Unix
+# socket on this layout:
+#
+#   - it persists across reboots (a tmpfs path under /run does not);
+#   - podman manages permissions and SELinux relabeling per consumer
+#     via :z on the Volume= line, so we don't have to drop a
+#     systemd-tmpfiles entry to recreate /run/podman-socket-proxy on
+#     every boot;
+#   - the underlying _data directory lives under
+#     /var/lib/containers/storage/volumes/<name>/, which is 0700
+#     root:root by default — non-root host processes can't even
+#     traverse there, so directory-level isolation is automatic.
+#
+# Generated unit name: podman-socket-proxy-volume.service. Both
+# Quadlets that reference this volume implicitly Require= it.
+#
+# Install:
+#   sudo install -m 0644 podman-socket-proxy.volume \
+#                /etc/containers/systemd/
+#   sudo systemctl daemon-reload
+#   # The volume is created on first reference; no `systemctl start`
+#   # is needed for it on its own.
+
+[Unit]
+Description=Named volume for the podman-socket-proxy listen socket
+
+[Volume]
+# Default driver "local" stores the volume's _data dir on the host
+# filesystem, which supports AF_UNIX. No options needed.

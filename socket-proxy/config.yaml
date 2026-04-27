@@ -1,0 +1,236 @@
+# yaml-language-server: $schema=
+#
+# podman-socket-proxy policy for the llama-swap orchestrator.
+#
+# Every request the llama-swap container can send to the host's rootful
+# podman socket has to match one of the (method, path) pairs below.
+# Anything else is denied with 403. POST /libpod/containers/create —
+# the only call that carries a body of policy interest — is further
+# gated by the `llama_swap_create` body policy, which restricts the
+# spec generator to exactly the shape llama-swap actually emits:
+#
+#   - one of three fully-qualified images
+#     (ghcr.io/ggml-org/llama.cpp:server-cuda,
+#      docker.io/vllm/vllm-openai:latest,
+#      docker.io/lmsysorg/sglang:latest);
+#   - bind sources rooted at LLAMA_MODELS_DIR (default /srv/llama-models);
+#   - the NVIDIA CDI device only;
+#   - --security-opt=label=disable only;
+#   - --network bridge with the llama-swap-internal network only;
+#   - --ipc=host (vLLM/SGLang) only.
+#
+# Anything else on the create body — privileged, cap_add, sysctl,
+# rootfs, extra mounts, /dev/* devices, custom seccomp/apparmor
+# profiles, host network/pid/uts, … — fails the zero-default check
+# and the request is refused.
+#
+# What this proxy does NOT cover:
+#   - llama-swap's own image pulls. Those happen out-of-band via
+#     scripts/pull-images.sh BEFORE the proxy is in the loop, so the
+#     pull endpoints aren't allowlisted here. If you ever want
+#     llama-swap to pull a missing image at runtime, you'll have to
+#     add a pull policy.
+#   - Anything on the host. The proxy gates the API surface; it does
+#     not constrain what podman does once it accepts a call (uidmap
+#     ranges, the GPU CDI spec, the network bridge, etc. are all the
+#     host's responsibility).
+#
+# To extend with a new model:
+#   1. Add the image reference to body_policies.llama_swap_create.image.allow
+#      (exact match — wildcard suffix permitted on the registry/repo
+#      portion, see ../../socket_proxy/socket-proxy/internal/policy/
+#      rules_image.go for the grammar).
+#   2. If the new model needs a host path outside LLAMA_MODELS_DIR,
+#      add it to body_policies.llama_swap_create.binds.allowed_sources.
+#   3. Reload the proxy:  systemctl restart podman-socket-proxy.service
+#      (the proxy re-reads its config at startup; there is no SIGHUP
+#      reload).
+
+proxy:
+  # Inside the proxy container the host's podman.sock is bind-mounted at
+  # /run/upstream/podman.sock (see podman-socket-proxy.container). Our
+  # listen socket lives inside a named volume (podman-socket-proxy.volume)
+  # that llama-swap also mounts. The file is named podman.sock here so
+  # that llama-swap, which mounts the same volume at /run/podman, sees it
+  # at /run/podman/podman.sock — matching the existing
+  # CONTAINER_HOST=unix:///run/podman/podman.sock without an env change.
+  upstream_socket: /run/upstream/podman.sock
+  listen_socket:   /run/socket-proxy/podman.sock
+  # 0666 because llama-swap runs under its own UID range
+  # (UidMap=0:900000:65536 in ../llama-swap/llama-swap.container), so
+  # the in-container UID 0 maps to host UID 900000 — not the file
+  # owner (root) and not in the file's group (root). 0660 would deny.
+  #
+  # 0666 is fine here because the socket isn't reachable to other host
+  # processes regardless of the file mode: the volume's underlying
+  # directory under /var/lib/containers/storage/volumes/ is 0700
+  # root:root, so non-root host processes can't even traverse to the
+  # socket. The mode just lets the deliberately-bind-mounted consumer
+  # container connect once it has the inode reference inside its own
+  # namespace. See ../README.md "Why 0666 is fine here" for the full
+  # access-model walkthrough.
+  listen_socket_mode: "0666"
+  watchdog_interval: 30s
+  stop_on_watchdog_fail: true
+  log_level: info
+  log_json: false
+  shutdown_grace: 10s
+
+endpoints:
+  # ---- Liveness / identity --------------------------------------------------
+  # podman-remote pings on every connection startup; without these even
+  # `podman version` 403s on /libpod/_ping. _ping is the one read
+  # endpoint we leave open to both wire shapes — podman-remote talks
+  # /libpod/_ping for the libpod-side liveness probe, but some
+  # internal code paths still hit the bare docker-compat /_ping
+  # (the upstream socket-proxy test harness allowlists it for that
+  # reason). Pure liveness probe, no policy implication, so we keep
+  # the alternation here.
+  - method: GET
+    path: ^/(v[0-9.]+/)?(libpod/)?_ping$
+  - method: HEAD
+    path: ^/(v[0-9.]+/)?(libpod/)?_ping$
+  # version and info are tightened to libpod-only — podman-remote
+  # always uses the libpod path for these and we don't want a
+  # docker-compat client probing the box.
+  - method: GET
+    path: ^/v[0-9.]+/libpod/version$
+  - method: GET
+    path: ^/v[0-9.]+/libpod/info$
+
+  # ---- Read-only container introspection ------------------------------------
+  # Inspect / exists / list / logs are pure reads; podman-remote
+  # occasionally inspects a container during the run/wait dance, and
+  # the llama-swap UI may poll logs. All libpod-only — podman-remote
+  # never hits the docker-compat /containers/* surface.
+  - method: GET
+    path: ^/v[0-9.]+/libpod/containers/json(\?.*)?$
+  - method: GET
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/json(\?.*)?$
+  - method: GET
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/exists(\?.*)?$
+  - method: GET
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/logs(\?.*)?$
+
+  # ---- Read-only image introspection ----------------------------------------
+  # podman-remote checks "is this image already local?" before deciding
+  # whether to pull. We don't allow pulls, so a missing image fails
+  # closed at the create step — but the inspect/exists path itself is
+  # safe and avoids spurious lookups failing. Libpod-only.
+  - method: GET
+    path: ^/v[0-9.]+/libpod/images/[^?]+/json(\?.*)?$
+  - method: GET
+    path: ^/v[0-9.]+/libpod/images/[^?]+/exists(\?.*)?$
+
+  # ---- Container create -----------------------------------------------------
+  # The single body-policed entry point. Docker-compat is intentionally
+  # NOT allowlisted here — `podman` (libpod) is the only client we care
+  # about; if you set CONTAINER_HOST and use the `docker` CLI you'll
+  # need to add the docker_create variant.
+  - method: POST
+    path: ^/v[0-9.]+/libpod/containers/create(\?.*)?$
+    body: llama_swap_create
+    body_shape: libpod_create
+
+  # ---- Container lifecycle --------------------------------------------------
+  # `podman run --rm --name X ...` (the foreground form llama-swap
+  # uses) does roughly:
+  #
+  #   POST /containers/create   — body-policed above
+  #   POST /containers/{X}/attach — hijacked stream for stdout/stderr
+  #   POST /containers/{X}/start
+  #   POST /containers/{X}/wait — blocks until exit
+  #   (daemon auto-removes because Remove=true is in the create body)
+  #
+  # `podman stop -t N X` is just POST /containers/{X}/stop. DELETE is
+  # included defensively for the rare case where podman-remote falls
+  # back to explicit removal on a stop timeout.
+  - method: POST
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/start(\?.*)?$
+  - method: POST
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/stop(\?.*)?$
+  - method: POST
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/wait(\?.*)?$
+  - method: POST
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/attach(\?.*)?$
+  - method: POST
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/resize(\?.*)?$
+  - method: DELETE
+    path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}(\?.*)?$
+
+body_policies:
+  llama_swap_create:
+    shape:
+      - libpod_create
+
+    # The three model-server images the llama-swap config currently
+    # references. Trailing-* prefix matching is supported (see
+    # rules_image.go); pinning to a digest with @sha256:<hash> would
+    # be tighter but requires updating this list every time you re-pull.
+    # Worth doing in a production-grade setup; documented in the README.
+    image:
+      allow:
+        - "ghcr.io/ggml-org/llama.cpp:server-cuda"
+        - "docker.io/vllm/vllm-openai:latest"
+        - "docker.io/lmsysorg/sglang:latest"
+
+    # Bind sources are restricted to LLAMA_MODELS_DIR. Path matching is
+    # by component (so "/srv/llama-models" matches "/srv/llama-models/
+    # gguf" and "/srv/llama-models/hf-cache/<model>" but not
+    # "/srv/llama-models-evil"). If you change LLAMA_MODELS_DIR in your
+    # .env, change it here too — there's no env-var interpolation.
+    binds:
+      allowed_sources:
+        - "/srv/llama-models"
+      allowed_options:
+        # `:ro` for read-only model dirs (gguf), `:Z` for SELinux
+        # private-relabel on the per-model HF cache. `rw` is implicit
+        # when no option is set, but listing it makes the intent
+        # explicit. `U` chowns the volume to the container's UID at
+        # mount time — used by some podman versions even when not
+        # asked, so listing it avoids spurious denies.
+        - "ro"
+        - "rw"
+        - "Z"
+        - "U"
+
+    # llama-swap spawns model containers on a custom bridge network
+    # (`--network llama-swap-internal`), which podman serialises as
+    # NetNS={NSMode: "bridge"} plus Networks={"llama-swap-internal": {}}.
+    # Only "bridge" is allowed; host/none/private/container/slirp/pasta
+    # all 403.
+    #
+    # IPC=host is required by vLLM and SGLang (CUDA shared-memory
+    # pool). Other namespaces stay at engine-default (empty, implicitly
+    # allowed).
+    namespaces:
+      network:
+        allow: [bridge]
+      ipc:
+        allow: [host]
+      # userns must include "host" because rootful podman often
+      # serialises NS values explicitly even when the user didn't pass
+      # --userns. See ../../socket_proxy/socket-proxy/CLAUDE.md
+      # "Rootless always sends userns: {nsmode: host}" — same protocol
+      # quirk applies in some rootful paths.
+      userns:
+        allow: [host]
+
+    # The NVIDIA GPU exposed via CDI. Real /dev/nvidia* nodes go in
+    # `devices` (which we don't need to allow because podman with CDI
+    # doesn't enumerate them on the libpod side); the symbolic
+    # "nvidia.com/gpu=all" goes in `cdi_devices`. Both feed into the
+    # same allowlist.
+    devices:
+      allow_paths:
+        - "nvidia.com/gpu=all"
+
+    # `--security-opt=label=disable` is what makes a CUDA workload
+    # actually start under SELinux-enabled hosts; without it the
+    # GPU char devices get the wrong label and CUDA initialisation
+    # fails. The allowlist is exact-match: any other security_opt
+    # flavor (custom seccomp paths, apparmor profiles, mask/unmask,
+    # other label= values) still denies.
+    security_opt:
+      allow:
+        - label=disable

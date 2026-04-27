@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# podman-socket-proxy — slim image for the proxy fronting the host's
+# rootful podman socket on behalf of the llama-swap orchestrator.
+#
+# Build context: this Containerfile expects the bcyrill/podman-socket-proxy
+# repo as its build context (i.e. the directory that contains the proxy's
+# go.mod and cmd/socket-proxy/). The build-image.sh wrapper next to this
+# file resolves that path for you; if you call podman build by hand:
+#
+#   cd /path/to/podman-socket-proxy
+#   podman build -t localhost/podman-socket-proxy:latest \
+#                -f /path/to/this/Containerfile .
+#
+# Layout of the resulting image:
+#   /usr/local/bin/socket-proxy    — the proxy binary (Go static)
+#   /etc/socket-proxy/config.yaml  — bind-mount target for the operator
+#                                    config (NOT baked in)
+# Listens on:
+#   /run/socket-proxy/socket-proxy.sock  (host-shared via the Quadlet)
+# Talks upstream to:
+#   /run/upstream/podman.sock           (rootful podman socket on host,
+#                                        bind-mounted in by the Quadlet)
+
+ARG GO_VERSION=1.23
+
+FROM docker.io/library/golang:${GO_VERSION}-alpine AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags "-s -w -X main.version=${VERSION}" \
+    -o /out/socket-proxy \
+    ./cmd/socket-proxy
+
+# Distroless static gives us /etc/passwd, ca-certs, tzdata, and
+# nothing else. No shell, no package manager. The proxy binary is
+# fully static (CGO disabled), so no glibc is needed either.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /out/socket-proxy /usr/local/bin/socket-proxy
+
+# Why root, not the distroless `nonroot` user (UID 65532):
+#
+# The host's rootful podman socket is `0660 root:root`. The proxy
+# connects to that socket via `connect(AF_UNIX)`, which requires
+# group/owner match — UID 65532 cannot reach it. The Quadlet runs
+# this container as host UID 0 (no UidMap), same pattern as
+# ../llama-swap/llama-swap.container; restating USER 0:0 here keeps the
+# image self-consistent if someone runs it without the Quadlet.
+#
+# The proxy itself never spawns a child process (it's a one-binary
+# net.Listen + http.ReverseProxy loop), and the Quadlet locks the
+# rootfs read-only and drops every capability — running as UID 0
+# inside the namespace is a far smaller blast radius than it sounds.
+USER 0:0
+WORKDIR /tmp
+
+ENTRYPOINT ["/usr/local/bin/socket-proxy"]
+CMD ["-config", "/etc/socket-proxy/config.yaml"]

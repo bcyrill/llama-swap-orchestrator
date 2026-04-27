@@ -1,0 +1,25 @@
+# Quadlet network for llama-swap <-> inference engine traffic.
+#
+# Install:
+#   sudo install -m 0644 llama-swap-internal.network /etc/containers/systemd/
+#   sudo systemctl daemon-reload
+#   # Generated unit name: llama-swap-internal-network.service
+#
+# The .network file creates a podman network of the same basename; both
+# the orchestrator and every inference container join it, so llama-swap
+# can reach them by container name (DNS) without publishing host ports.
+
+[Unit]
+Description=Internal podman network for llama-swap and inference engines
+
+[Network]
+NetworkName=llama-swap-internal
+Driver=bridge
+DisableDNS=false
+# Pick a subnet that doesn't collide with traefik-internal or any other
+# existing podman network on the host:
+Subnet=10.89.20.0/24
+Gateway=10.89.20.1
+
+[Install]
+WantedBy=default.target

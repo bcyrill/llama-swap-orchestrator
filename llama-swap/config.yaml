@@ -1,0 +1,149 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/mostlygeek/llama-swap/refs/heads/main/config-schema.json
+#
+# llama-swap config for the containerised orchestrator deployment.
+#
+# Shape:
+#   - llama-swap runs inside its own container; it drives the HOST podman
+#     daemon via /run/podman/podman.sock (which is the proxy's listen
+#     socket, mounted in via the podman-socket-proxy.volume named volume —
+#     see ../socket-proxy/).
+#   - Model containers attach to the `llama-swap-internal` network instead
+#     of publishing host ports. llama-swap reaches them via container DNS
+#     name on the in-container port (8080 / 8000 / 30000).
+#   - LLAMA_MODELS_DIR macros must hold HOST paths — they are sent verbatim
+#     to the host daemon as bind-mount sources, then matched against the
+#     proxy's binds.allowed_sources allowlist.
+#   - Every command passes --pull=never so a missing image fails locally
+#     with "image not known" rather than bouncing off a proxy 403. See
+#     ../README.md "Image pulls and the podman run lifecycle".
+#
+# Per-model UID range (must match scripts/uid-ranges.env):
+#   llamacpp-qwen2.5-7b      -> 0:500000:65536
+#   llamacpp-bge-reranker    -> 0:600000:65536
+#   vllm-llama3.1-8b         -> 0:700000:65536
+#   sglang-qwen2.5-14b       -> 0:800000:65536
+
+healthCheckTimeout: 600
+logLevel: info
+# startPort is unused in this mode — left at the default for safety.
+
+macros:
+  models_dir: "${env.LLAMA_MODELS_DIR}"
+  hf_cache:   "${env.LLAMA_MODELS_DIR}/hf-cache"
+  gguf_dir:   "${env.LLAMA_MODELS_DIR}/gguf"
+
+  gpu_flags: "--device nvidia.com/gpu=all --security-opt=label=disable"
+  net_flags: "--network llama-swap-internal"
+
+  llamacpp_image: "ghcr.io/ggml-org/llama.cpp:server-cuda"
+  vllm_image:     "docker.io/vllm/vllm-openai:latest"
+  sglang_image:   "docker.io/lmsysorg/sglang:latest"
+
+  hf_token_env: "HUGGING_FACE_HUB_TOKEN=${env.HF_TOKEN}"
+
+models:
+
+  # ===========================================================================
+  # llama.cpp — in-container port 8080
+  # UID range: 0:500000:65536
+  # ===========================================================================
+  "llamacpp-qwen2.5-7b":
+    name: "Qwen2.5-7B-Instruct (llama.cpp / GGUF)"
+    cmd: |
+      podman run --name ${MODEL_ID} --rm --init --pull=never
+      --uidmap 0:500000:65536
+      --gidmap 0:500000:65536
+      ${gpu_flags} ${net_flags}
+      -v ${gguf_dir}:/models:ro
+      -v ${hf_cache}/${MODEL_ID}:/cache:Z
+      ${llamacpp_image}
+      --host 0.0.0.0 --port 8080
+      -m /models/Qwen2.5-7B-Instruct-Q5_K_M.gguf
+      -ngl 99 -c 16384 --jinja --no-warmup
+    cmdStop: podman stop -t 10 ${MODEL_ID}
+    proxy: "http://${MODEL_ID}:8080"
+    checkEndpoint: /health
+    ttl: 600
+
+  "llamacpp-bge-reranker":
+    name: "BGE Reranker v2 m3 (llama.cpp / GGUF)"
+    cmd: |
+      podman run --name ${MODEL_ID} --rm --init --pull=never
+      --uidmap 0:600000:65536
+      --gidmap 0:600000:65536
+      ${gpu_flags} ${net_flags}
+      -v ${gguf_dir}:/models:ro
+      -v ${hf_cache}/${MODEL_ID}:/cache:Z
+      ${llamacpp_image}
+      --host 0.0.0.0 --port 8080
+      -m /models/bge-reranker-v2-m3-Q8_0.gguf
+      -ngl 99 --reranking
+    cmdStop: podman stop -t 5 ${MODEL_ID}
+    proxy: "http://${MODEL_ID}:8080"
+    checkEndpoint: /health
+    ttl: 0
+
+  # ===========================================================================
+  # vLLM — in-container port 8000
+  # UID range: 0:700000:65536
+  # ===========================================================================
+  "vllm-llama3.1-8b":
+    name: "Llama-3.1-8B-Instruct (vLLM)"
+    cmd: |
+      podman run --name ${MODEL_ID} --rm --init --pull=never
+      --uidmap 0:700000:65536
+      --gidmap 0:700000:65536
+      ${gpu_flags} ${net_flags} --ipc=host
+      -v ${hf_cache}/${MODEL_ID}:/root/.cache/huggingface:Z
+      -e ${hf_token_env}
+      ${vllm_image}
+      --host 0.0.0.0 --port 8000
+      --model meta-llama/Llama-3.1-8B-Instruct
+      --served-model-name ${MODEL_ID}
+      --max-model-len 16384
+      --gpu-memory-utilization 0.90
+      --enable-prefix-caching
+    cmdStop: podman stop -t 30 ${MODEL_ID}
+    proxy: "http://${MODEL_ID}:8000"
+    checkEndpoint: /health
+    ttl: 1800
+
+  # ===========================================================================
+  # SGLang — in-container port 30000
+  # UID range: 0:800000:65536
+  # ===========================================================================
+  "sglang-qwen2.5-14b":
+    name: "Qwen2.5-14B-Instruct (SGLang)"
+    cmd: |
+      podman run --name ${MODEL_ID} --rm --init --pull=never
+      --uidmap 0:800000:65536
+      --gidmap 0:800000:65536
+      ${gpu_flags} ${net_flags} --ipc=host --shm-size=16g
+      -v ${hf_cache}/${MODEL_ID}:/root/.cache/huggingface:Z
+      -e ${hf_token_env}
+      ${sglang_image}
+      python3 -m sglang.launch_server
+      --host 0.0.0.0 --port 30000
+      --model-path Qwen/Qwen2.5-14B-Instruct
+      --served-model-name ${MODEL_ID}
+      --context-length 16384
+      --mem-fraction-static 0.85
+    cmdStop: podman stop -t 30 ${MODEL_ID}
+    proxy: "http://${MODEL_ID}:30000"
+    checkEndpoint: /health
+    ttl: 1800
+
+matrix:
+  vars:
+    g: llamacpp-qwen2.5-7b
+    v: vllm-llama3.1-8b
+    s: sglang-qwen2.5-14b
+    r: llamacpp-bge-reranker
+  evict_costs:
+    v: 50
+    s: 40
+    g: 5
+    r: 1
+  sets:
+    llm_with_rerank: "(g | v | s) & r"
+    llm_only: "g | v | s"
