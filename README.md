@@ -15,6 +15,64 @@ the orchestrator process is bounded by exactly that policy, not by
 [llama-swap]: https://github.com/mostlygeek/llama-swap
 [podman-socket-proxy]: https://github.com/bcyrill/podman-socket-proxy
 
+## Accuracy notice
+
+This project — code, Containerfiles, Quadlets, scripts, the
+socket-proxy policy YAML, and this documentation — was created with
+substantial assistance from [Anthropic's Claude]. LLM-generated work
+can carry inaccuracies, subtle logic errors, and stale assumptions
+about upstream behaviour (podman protocol quirks, wire shapes, edge
+cases the test suite doesn't reach). At least one such mistake was
+already caught and fixed mid-development: an early version of the
+proxy policy denied `POST /libpod/images/pull` outright, which broke
+every model spawn under podman 5.x because that endpoint is the
+client's unified image-resolve path even with `--pull=never`.
+Treat that as evidence of the genre, not as proof the rest is right.
+
+[Anthropic's Claude]: https://www.anthropic.com/claude
+
+The socket-proxy is a security boundary. A permissive misconfiguration
+hands the orchestrator more privilege than intended; a wrong
+assumption baked into a body decoder lets through something the
+operator believes is denied. **Before deploying this in front of a
+production rootful podman socket, validate it independently.** That
+means at minimum:
+
+- Read [`socket-proxy/config.yaml`](socket-proxy/config.yaml) and
+  confirm every `endpoints:` entry, the `body_policies` /
+  `pull_policies` rules, and each allowlist matches your threat
+  model. The shipped policy is exactly what llama-swap's commands in
+  [`llama-swap/config.yaml`](llama-swap/config.yaml) need — nothing
+  more — but the surface it permits (three model images, a single
+  bind-source prefix, the NVIDIA CDI device, `--ipc=host`,
+  `--security-opt=label=disable`) is yours to accept.
+- Read the upstream
+  [podman-socket-proxy](https://github.com/bcyrill/podman-socket-proxy)
+  README, especially its own "Accuracy notice." That project is the
+  parser doing the actual gating, and it carries the same caveats
+  about LLM authorship.
+- Exercise the stack end-to-end against the real podman version you
+  intend to run. Watch the proxy log; any 403 you didn't expect is
+  either a legitimate gating decision or a policy mistake — both
+  deserve attention before going live. The included
+  `scripts/dev-stack.sh` makes a rootless dry-run cheap.
+- Re-run the upstream proxy's
+  `scripts/audit/apiv2-coverage.sh` on every podman upgrade. Podman
+  occasionally adds top-level fields to the libpod create body; the
+  proxy's strict `DisallowUnknownFields` will fail closed (good), but
+  you'll need a rebuild to recognise the new field.
+- Treat the validate-script + 12-case end-to-end smoke test the repo
+  ships as a starting point, not as proof of safety. They catch the
+  obvious shapes, not every possible malicious body. A real audit
+  walks every field of `libpodCreateRequest` against the threat
+  model.
+
+If something here doesn't match the production posture you want,
+edit the policy and re-run `./scripts/validate-proxy-config.sh`
+before pushing it live. Report mistakes as issues; tightening the
+allowlist in response to a real deny log is exactly the workflow
+this is designed for.
+
 ## What runs where
 
 ```
