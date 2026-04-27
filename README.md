@@ -22,12 +22,7 @@ socket-proxy policy YAML, and this documentation — was created with
 substantial assistance from [Anthropic's Claude]. LLM-generated work
 can carry inaccuracies, subtle logic errors, and stale assumptions
 about upstream behaviour (podman protocol quirks, wire shapes, edge
-cases the test suite doesn't reach). At least one such mistake was
-already caught and fixed mid-development: an early version of the
-proxy policy denied `POST /libpod/images/pull` outright, which broke
-every model spawn under podman 5.x because that endpoint is the
-client's unified image-resolve path even with `--pull=never`.
-Treat that as evidence of the genre, not as proof the rest is right.
+cases the test suite doesn't reach).
 
 [Anthropic's Claude]: https://www.anthropic.com/claude
 
