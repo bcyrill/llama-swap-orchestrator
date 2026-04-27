@@ -130,7 +130,7 @@ do exactly this and nothing else:
 | Bind `/etc/shadow:/shadow`             | 403             |
 | Image not in the three-entry allowlist | 403             |
 | `POST /v1.41/containers/create` (docker-compat) | 403    |
-| `POST /libpod/images/pull`             | 403             |
+| `POST /libpod/images/pull` for an unlisted image | 403    |
 | `POST /libpod/build`                   | 403             |
 | Custom seccomp / apparmor profiles     | 403             |
 | Anything that touches networks, volumes, secrets, pods, exec, kube, manifests, quadlets, system prune, … | 403 |
@@ -283,35 +283,51 @@ sudo curl --unix-socket "$SOCK" \
 
 ## Image pulls and the `podman run` lifecycle
 
-The proxy does not allow `POST /libpod/images/pull`. Image pulls run
-out-of-band, before the proxy is in the loop, via
+Image pulls run out-of-band before the proxy is in the loop, via
 `scripts/pull-images.sh` on the host. That script uses the host's
 podman directly, not the proxy.
 
-Two questions follow:
+The proxy does allow `POST /libpod/images/pull`, but **only for the
+three listed images**. This isn't a way to enable runtime fetches —
+it's a podman 5.x quirk. In modern podman the libpod client uses
+`POST /libpod/images/pull` as the *unified* image-resolution endpoint,
+parameterised by `?policy=<never|missing|always|newer>`. Even
+`podman run --pull=never` round-trips through here with `?policy=never`
+to ask the daemon "do you have this image, yes or no?" — no fetch
+happens, but the URL still says `/pull`. Denying the endpoint outright
+breaks every spawn, even when the image is already local. So we allow
+the endpoint and gate it by the same image allowlist the create body
+uses (see `pull_policies.llama_swap_pull` in `socket-proxy/config.yaml`).
 
 **Will `podman run` try to update the image at runtime?** No.
 `podman run` defaults to `--pull=missing` (only fetch when the image
 is absent), so a re-run against an already-local `image:latest` keeps
-using the local copy even after the upstream tag has moved. On top of
-that, every model command in `llama-swap/config.yaml` passes
-`--pull=never` explicitly: the client refuses to pull at runtime
-regardless of `--pull` policy defaults in future podman versions, and
-refuses without a proxy round-trip. `--pull=always` / `--pull=newer`
-would request an update, but nothing in the shipped config does.
+using the local copy even after the upstream tag has moved. Every
+model command in `llama-swap/config.yaml` also passes `--pull=never`
+explicitly so the daemon-side resolver short-circuits with "yes I have
+it" without checking remote.
 
-**What happens if an image isn't pre-pulled?** With `--pull=never`,
-`podman run` aborts locally with `Error: <ref>: image not known` — no
-pull attempt, no proxy involvement, no confusing 403. (Without
-`--pull=never`, it would be: `GET /libpod/images/{ref}/exists` → 404 →
-`POST /libpod/images/pull` → proxy 403 → abort. Same outcome, worse
-error message.)
+**What happens if an image isn't pre-pulled?** With `--pull=never`:
+
+1. `POST /libpod/images/pull?reference=<image>&policy=never` →
+   - if the image is on the proxy's allowlist: forwarded to daemon →
+     daemon returns 404 because the image isn't local → podman
+     surfaces `Error: <ref>: image not known`.
+   - if the image is *not* on the allowlist: proxy 403s with
+     `image=<ref> not in allowlist`.
+
+The first case is "operator forgot to pre-pull a known model"; the
+second is "config drift, the policy hasn't been updated for a new
+model." Both fail closed; the deny reason makes which one obvious.
 
 A new model image therefore needs to be pre-pulled before its first
-run:
+run AND added to the proxy's image allowlist:
 
 ```bash
 sudo ./scripts/pull-images.sh    # or `sudo podman pull <ref>` for one
+# then edit socket-proxy/config.yaml to add the new image to BOTH
+# body_policies.llama_swap_create.image.allow AND
+# pull_policies.llama_swap_pull.image.allow, and bounce the proxy.
 ```
 
 Same workflow as before the proxy existed; the proxy just makes the
@@ -327,9 +343,11 @@ the surface to whatever the runtime pull would have brought.
    `--uidmap 0:<BASE>:65536 --gidmap 0:<BASE>:65536` and
    `--pull=never`.
 5. Add a var letter to `matrix.vars` and update `matrix.sets`.
-6. **Add the new image reference to
-   `socket-proxy/config.yaml`'s `body_policies.llama_swap_create.image.allow`
-   list** — the proxy denies any image not on this list. Re-run
+6. **Add the new image reference to BOTH allowlists in
+   `socket-proxy/config.yaml`** — the create body's
+   `body_policies.llama_swap_create.image.allow` *and* the pull
+   resolver's `pull_policies.llama_swap_pull.image.allow`. Both gates
+   have to know about the new image or the spawn 403s. Re-run
    `./scripts/validate-proxy-config.sh` and bounce the proxy:
 
    ```bash

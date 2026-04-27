@@ -113,14 +113,27 @@ endpoints:
     path: ^/v[0-9.]+/libpod/containers/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}/logs(\?.*)?$
 
   # ---- Read-only image introspection ----------------------------------------
-  # podman-remote checks "is this image already local?" before deciding
-  # whether to pull. We don't allow pulls, so a missing image fails
-  # closed at the create step — but the inspect/exists path itself is
-  # safe and avoids spurious lookups failing. Libpod-only.
+  # podman-remote checks "is this image already local?" before spawning.
   - method: GET
     path: ^/v[0-9.]+/libpod/images/[^?]+/json(\?.*)?$
   - method: GET
     path: ^/v[0-9.]+/libpod/images/[^?]+/exists(\?.*)?$
+
+  # ---- Image resolve / pull --------------------------------------------------
+  # podman 5.x uses POST /libpod/images/pull as the *unified* image
+  # resolution endpoint. Even with `--pull=never`, podman-remote still
+  # round-trips through here — with `?policy=never` — to ask the daemon
+  # "do you have this image, yes or no?". Denying the endpoint outright
+  # 403s every model spawn before the daemon ever runs the lookup. So we
+  # allow it, but gate it by the SAME image allowlist the create body
+  # uses (see body_policies.llama_swap_create.image and pull_policies
+  # below). policy=missing/always would actually fetch; with our
+  # pre-pull workflow that's a no-op for listed images, and unlisted
+  # images can't be referenced through this endpoint either way.
+  - method: POST
+    path: ^/v[0-9.]+/libpod/images/pull(\?.*)?$
+    pull: llama_swap_pull
+    pull_shape: libpod_pull
 
   # ---- Container create -----------------------------------------------------
   # The single body-policed entry point. Docker-compat is intentionally
@@ -234,3 +247,38 @@ body_policies:
     security_opt:
       allow:
         - label=disable
+
+pull_policies:
+  # Mirrors the create-time image allowlist exactly. The pull endpoint
+  # decodes the URL's `?reference=...` parameter and checks it against
+  # this list — unlisted images 403 before reaching the daemon. Listed
+  # images are accepted; what the daemon does with the request depends
+  # on `?policy=`:
+  #
+  #   policy=never              → daemon resolves locally, no fetch
+  #                              (this is the path podman 5.x takes for
+  #                              `--pull=never` even though the URL
+  #                              still says "/pull")
+  #   policy=missing  (default) → daemon fetches if not local; with
+  #                              pre-pulled images this is a no-op
+  #   policy=always / newer     → daemon fetches; with our pre-pull
+  #                              workflow nothing should hit this path,
+  #                              but if it did, the registry of record
+  #                              for these images is what'd be reached.
+  #
+  # If you want to deny actual fetches and only permit the resolve-only
+  # path, add a `query: { policy: ^never$, ... }` block to the endpoint
+  # — note that `query:` is strict so you'll have to enumerate every
+  # other parameter podman-remote sends (Arch, OS, Variant, Quiet, …),
+  # which is brittle across podman versions. Easier in practice to keep
+  # this list tight (digest pins, not :tag) and accept the small
+  # widening.
+  llama_swap_pull:
+    # Only the libpod wire shape; the docker-compat /images/create
+    # endpoint isn't allowlisted, so docker_pull would be dead code.
+    shape: [libpod_pull]
+    image:
+      allow:
+        - "ghcr.io/ggml-org/llama.cpp:server-cuda"
+        - "docker.io/vllm/vllm-openai:latest"
+        - "docker.io/lmsysorg/sglang:latest"
